@@ -1,0 +1,1079 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Arcade Flight Simulator</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #58c8ff 0%, #bceeff 52%, #ffe8a3 100%);
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      color: #f8fbff;
+      background: rgba(8, 15, 28, 0.68);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+      user-select: none;
+      z-index: 3;
+    }
+
+    #stallWarning {
+      margin-left: 8px;
+      color: #ff3737;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+    }
+
+    #message {
+      position: fixed;
+      left: 50%;
+      top: 44%;
+      transform: translate(-50%, -50%);
+      padding: 16px 22px;
+      border-radius: 18px;
+      color: white;
+      background: rgba(6, 12, 24, 0.74);
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      font-size: 20px;
+      font-weight: 850;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity var(--message-fade-ms) ease;
+      z-index: 4;
+    }
+
+    #message.visible {
+      opacity: 1;
+    }
+
+    #message.crash {
+      background: rgba(135, 16, 18, 0.8);
+    }
+
+    #startOverlay {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: rgba(2, 7, 16, 0.7);
+      z-index: 10;
+      transition:
+        opacity var(--overlay-fade-ms) ease,
+        visibility var(--overlay-fade-ms) ease;
+    }
+
+    #startOverlay.hidden {
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+    }
+
+    .card {
+      width: min(92vw, 520px);
+      padding: 30px;
+      text-align: center;
+      color: #f7fbff;
+      border-radius: 24px;
+      background: linear-gradient(180deg, rgba(18, 31, 54, 0.94), rgba(8, 15, 28, 0.92));
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
+    }
+
+    .card h1 {
+      margin: 0 0 10px;
+      font-size: clamp(32px, 6vw, 52px);
+      line-height: 1;
+    }
+
+    .card p {
+      margin: 0 0 24px;
+      color: rgba(247, 251, 255, 0.78);
+    }
+
+    #startButton {
+      border: 0;
+      border-radius: 999px;
+      padding: 13px 24px;
+      color: #06101d;
+      background: #ffe06b;
+      font-size: 16px;
+      font-weight: 900;
+      cursor: pointer;
+      box-shadow: 0 8px 24px rgba(255, 224, 107, 0.28);
+    }
+
+    #startButton:focus-visible,
+    #startButton:hover {
+      filter: brightness(1.06);
+      outline: 3px solid rgba(255, 255, 255, 0.5);
+      outline-offset: 3px;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div>SPD <span id="speed">0</span> km/h <span id="stallWarning"></span></div>
+    <div>ALT <span id="altitude">0</span> m AGL</div>
+    <div>THR <span id="throttle">0</span>%</div>
+    <div>PIT <span id="pitch">0</span>°</div>
+  </div>
+
+  <div id="message"></div>
+
+  <div id="startOverlay">
+    <section class="card">
+      <h1>Skyline Courier</h1>
+      <p>W/S pitch, A/D roll, Q/E yaw, Space/Shift throttle, R reset.</p>
+      <button id="startButton" type="button">Start Engine</button>
+    </section>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <script>
+    // 1. CONFIG
+    const CONFIG = {
+      maxSpeed: 95, // Maximum aircraft speed in meters per second.
+      acceleration: 30, // Full-throttle forward acceleration in meters per second squared.
+      dragCoefficient: 0.0032, // Quadratic drag strength; higher values slow the aircraft harder at speed.
+      gravity: 9.81, // Downward world-space acceleration in meters per second squared.
+      liftCoefficient: 0.0155, // Lift acceleration multiplier applied to forward speed squared.
+      stallSpeed: 23, // Forward speed in meters per second where lift starts collapsing below this value.
+      stallWarningMargin: 1.2, // HUD stall warning threshold as stallSpeed multiplied by this value.
+      pitchSpeed: 1.35, // Local pitch rotation speed in radians per second at full authority.
+      rollSpeed: 2.25, // Local roll rotation speed in radians per second at full authority.
+      yawSpeed: 0.75, // Local yaw rotation speed in radians per second at full authority.
+      throttleRate: 0.72, // Per-second rate for target throttle changes and current throttle smoothing.
+      controlAuthorityMinSpeed: 32, // Speed where control authority reaches full strength.
+      cameraLerpFactor: 0.085, // Camera smoothing factor at the reference frame rate.
+      cameraOffset: { x: 0, y: 9, z: -29 }, // Local camera offset in meters; forward is +Z, so negative Z is behind.
+      crashVerticalSpeed: 8.5, // Downward impact speed in meters per second that triggers a crash.
+      crashImpactAngle: 30, // Maximum safe absolute pitch or roll angle on contact, in degrees.
+      groundContactEpsilon: 0.32, // Extra contact tolerance in meters to prevent jitter near terrain.
+      resetMessageDuration: 1.4, // Seconds reset and boundary messages remain visible.
+      crashMessageDuration: 1.5, // Seconds crash message remains visible before automatic reset.
+      shadowMapSize: 2048, // Directional shadow texture size; higher is sharper and heavier.
+      shadowCameraExtent: 95, // Half-size of the shadow camera box around the aircraft.
+      worldSize: 2000, // Full terrain width/depth in meters; leaving half this range soft-resets the plane.
+      terrainSegments: 150, // Terrain mesh subdivisions per side.
+      runwayLength: 420, // Runway length in meters.
+      runwayWidth: 34, // Runway width in meters.
+      terrainHeightScale: 27, // Terrain hill amplitude in meters.
+      terrainFrequency: 0.006, // Low-frequency sine terrain scale; smaller creates broader hills.
+      devicePixelRatioCap: 2, // Maximum renderer pixel ratio for performance on dense screens.
+
+      planeGroundClearance: 1.15, // Plane origin height above terrain when resting on the ground.
+      maxDeltaTime: 0.1, // Maximum requestAnimationFrame delta in seconds for physics stability.
+      referenceFrameRate: 60, // Reference FPS for delta-time-aware camera smoothing.
+      cameraFov: 66, // Camera vertical field of view in degrees.
+      cameraNear: 0.1, // Camera near clip distance in meters.
+      cameraFar: 3600, // Camera far clip distance in meters.
+      cameraLookAhead: 28, // Meters ahead of the plane the camera looks toward.
+      cameraLookUpBias: 2.4, // Meters above the plane added to the camera look target.
+      shadowCameraNear: 1, // Directional shadow camera near clip distance.
+      shadowCameraFar: 430, // Directional shadow camera far clip distance.
+      fogNear: 620, // Distance where atmospheric fog begins.
+      fogFar: 1900, // Distance where atmospheric fog becomes opaque.
+      ambientLightIntensity: 1.75, // Ambient light strength.
+      directionalLightIntensity: 2.35, // Directional sunlight strength.
+      sunOffset: { x: 115, y: 230, z: -125 }, // Directional light offset from the plane in meters.
+
+      runwayCenterZ: 0, // Runway center Z coordinate in meters.
+      runwayElevation: 1.6, // Flat terrain height under the runway in meters.
+      runwaySurfaceOffset: 0.06, // Visual lift above terrain to avoid z-fighting.
+      runwayThickness: 0.12, // Runway slab thickness in meters.
+      runwayFlattenBlendDistance: 46, // Meters used to blend runway-flat terrain into hills.
+      runwayStartOffsetFactor: 0.43, // Spawn point as a fraction of runway length behind center.
+      runwayStripeLength: 20, // Painted center stripe length in meters.
+      runwayStripeGap: 16, // Gap between runway center stripes in meters.
+      runwayStripeWidth: 1.4, // Painted center stripe width in meters.
+      runwayStripeThickness: 0.025, // Painted center stripe thickness in meters.
+      runwayStripeInset: 22, // Empty runway margin before first and after last stripe in meters.
+
+      terrainSecondaryFrequencyFactor: 1.62, // Secondary wave frequency multiplier.
+      terrainCrossFrequencyFactor: 0.31, // Cross-axis mix for the first terrain wave.
+      terrainSecondaryCrossFactor: 0.42, // Cross-axis mix for the second terrain wave.
+      terrainSineWeight: 0.52, // Weight of the first terrain wave.
+      terrainCosineWeight: 0.34, // Weight of the second terrain wave.
+      terrainNoiseWeight: 0.42, // Weight of value noise in terrain height.
+      terrainNoiseScale: 115, // Value-noise lattice spacing in meters.
+
+      treeCount: 170, // Number of cone trees placed in the world.
+      treeAvoidRunwayMargin: 76, // Clear radius around runway for trees in meters.
+      treeTrunkHeight: 2.1, // Tree trunk base height in meters.
+      treeTrunkRadius: 0.22, // Tree trunk base radius in meters.
+      treeFoliageHeight: 5.4, // Tree cone foliage base height in meters.
+      treeFoliageRadius: 1.7, // Tree cone foliage base radius in meters.
+      treeScaleMin: 0.72, // Minimum random tree scale.
+      treeScaleMax: 1.55, // Maximum random tree scale.
+      treeSegments: 7, // Low-poly tree radial segment count.
+
+      buildingCount: 30, // Number of box buildings placed in the world.
+      buildingAvoidRunwayMargin: 105, // Clear radius around runway for buildings in meters.
+      buildingWidthMin: 8, // Minimum building width in meters.
+      buildingWidthMax: 24, // Maximum building width in meters.
+      buildingDepthMin: 8, // Minimum building depth in meters.
+      buildingDepthMax: 30, // Maximum building depth in meters.
+      buildingHeightMin: 8, // Minimum building height in meters.
+      buildingHeightMax: 46, // Maximum building height in meters.
+
+      mountainCount: 18, // Number of distant cone/pyramid mountains.
+      mountainRadiusFactor: 0.44, // Mountain placement radius as a fraction of worldSize.
+      mountainHeightMin: 55, // Minimum mountain height in meters.
+      mountainHeightMax: 145, // Maximum mountain height in meters.
+      mountainRadiusMin: 38, // Minimum mountain base radius in meters.
+      mountainRadiusMax: 95, // Maximum mountain base radius in meters.
+      mountainSegments: 4, // Pyramid-like mountain radial segment count.
+
+      fuselageWidth: 1.25, // Aircraft fuselage width in meters.
+      fuselageHeight: 1.05, // Aircraft fuselage height in meters.
+      fuselageLength: 7.2, // Aircraft fuselage length in meters.
+      noseLength: 1.35, // Nose cone length in meters.
+      noseRadius: 0.68, // Nose cone base radius in meters.
+      wingSpan: 9.8, // Main wing span in meters.
+      wingChord: 1.75, // Main wing chord in meters.
+      wingThickness: 0.14, // Main wing thickness in meters.
+      wingZ: 0.15, // Main wing local Z position in meters.
+      tailZ: -3.45, // Tail local Z position in meters.
+      tailSpan: 3.9, // Horizontal tail span in meters.
+      tailChord: 1.05, // Horizontal tail chord in meters.
+      tailThickness: 0.12, // Horizontal tail thickness in meters.
+      finWidth: 0.14, // Vertical fin thickness in meters.
+      finHeight: 1.45, // Vertical fin height in meters.
+      finLength: 1.15, // Vertical fin length in meters.
+      finYOffset: 0.82, // Vertical fin center height in meters.
+      propellerRadius: 1.05, // Propeller disc radius in meters.
+      propellerThickness: 0.035, // Propeller disc thickness in meters.
+      propellerBladeLength: 1.85, // Propeller blade length in meters.
+      propellerBladeWidth: 0.18, // Propeller blade width in meters.
+      propellerBladeThickness: 0.055, // Propeller blade thickness in meters.
+      propellerForwardOffset: 0.16, // Propeller distance forward of nose tip in meters.
+      propellerIdleSpin: 7, // Propeller radians per second at zero throttle once started.
+      propellerThrottleSpin: 74, // Extra propeller radians per second at full throttle.
+      propellerDiscOpacity: 0.22, // Transparent propeller disc opacity.
+
+      stallFlashInterval: 0.24, // Seconds per stall warning flash cycle.
+      messageFadeMilliseconds: 160, // CSS fade duration for center HUD messages.
+      overlayFadeMilliseconds: 220, // CSS fade duration for start overlay.
+      speedToKmh: 3.6, // Conversion from meters per second to kilometers per hour.
+      throttlePercentScale: 100, // Conversion from 0–1 throttle to percent.
+      hudDecimals: 0, // Number of decimals shown on HUD values.
+      millisecondsPerSecond: 1000, // Converts RAF milliseconds to seconds.
+      half: 0.5, // Shared half multiplier for centered dimensions.
+      two: 2, // Shared doubling helper for symmetric formulas.
+      smoothA: 3, // Smoothstep coefficient.
+      smoothB: 2, // Smoothstep coefficient.
+      rightAngle: Math.PI * 0.5, // Ninety-degree radians helper.
+      fullCircle: Math.PI * 2, // Full circle radians helper.
+      signedUnitMin: -1, // Signed normalized clamp lower bound.
+
+      noiseHashX: 127.1, // Value-noise hash X multiplier.
+      noiseHashZ: 311.7, // Value-noise hash Z multiplier.
+      noiseHashScale: 43758.5453, // Value-noise hash scale.
+      randomHashFactor: 12.9898, // Deterministic scenery random hash multiplier.
+      randomHashScale: 43758.5453, // Deterministic scenery random hash scale.
+      randomSaltX: 19.19, // Random salt for X coordinates.
+      randomSaltZ: 71.73, // Random salt for Z coordinates.
+      randomSaltScale: 131.37, // Random salt for sizes.
+      treeSeedOffset: 100, // Tree random seed offset.
+      buildingSeedOffset: 500, // Building random seed offset.
+      mountainSeedOffset: 900, // Mountain random seed offset.
+
+      colors: {
+        fog: '#bfefff',
+        terrain: '#55b948',
+        runway: '#2b3038',
+        stripe: '#f8f4df',
+        fuselage: '#f7f0df',
+        nose: '#ff5a4d',
+        wing: '#ffcf4a',
+        tail: '#4aa8ff',
+        propellerDisc: '#d8f3ff',
+        propellerBlade: '#1f2937',
+        trunk: '#7a4a22',
+        foliage: '#1f9f55',
+        building: '#7c8da8',
+        mountain: '#6f7f89',
+        ambient: '#d9f5ff',
+        sun: '#ffffff'
+      }
+    };
+
+    // 2. DOM References
+    const el = {
+      speed: document.getElementById('speed'),
+      altitude: document.getElementById('altitude'),
+      throttle: document.getElementById('throttle'),
+      pitch: document.getElementById('pitch'),
+      stall: document.getElementById('stallWarning'),
+      message: document.getElementById('message'),
+      overlay: document.getElementById('startOverlay'),
+      startButton: document.getElementById('startButton')
+    };
+
+    document.documentElement.style.setProperty('--message-fade-ms', `${CONFIG.messageFadeMilliseconds}ms`);
+    document.documentElement.style.setProperty('--overlay-fade-ms', `${CONFIG.overlayFadeMilliseconds}ms`);
+
+    // 3. Scene Setup
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.Fog(CONFIG.colors.fog, CONFIG.fogNear, CONFIG.fogFar);
+
+    const camera = new THREE.PerspectiveCamera(
+      CONFIG.cameraFov,
+      window.innerWidth / window.innerHeight,
+      CONFIG.cameraNear,
+      CONFIG.cameraFar
+    );
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setClearAlpha(0);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CONFIG.devicePixelRatioCap));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(CONFIG.colors.ambient, CONFIG.ambientLightIntensity));
+
+    const sun = new THREE.DirectionalLight(CONFIG.colors.sun, CONFIG.directionalLightIntensity);
+    sun.castShadow = true;
+    sun.shadow.mapSize.width = CONFIG.shadowMapSize;
+    sun.shadow.mapSize.height = CONFIG.shadowMapSize;
+    sun.shadow.camera.near = CONFIG.shadowCameraNear;
+    sun.shadow.camera.far = CONFIG.shadowCameraFar;
+
+    // Local shadow frustum follows the plane: sharper nearby shadows, not whole-world shadows.
+    sun.shadow.camera.left = -CONFIG.shadowCameraExtent;
+    sun.shadow.camera.right = CONFIG.shadowCameraExtent;
+    sun.shadow.camera.top = CONFIG.shadowCameraExtent;
+    sun.shadow.camera.bottom = -CONFIG.shadowCameraExtent;
+    sun.shadow.camera.updateProjectionMatrix();
+    scene.add(sun, sun.target);
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CONFIG.devicePixelRatioCap));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    const LOCAL_RIGHT = new THREE.Vector3(1, 0, 0);
+    const LOCAL_UP = new THREE.Vector3(0, 1, 0);
+    const LOCAL_FORWARD = new THREE.Vector3(0, 0, 1);
+    const WORLD_UP = new THREE.Vector3(0, 1, 0);
+
+    // 4. World Generation
+    function clamp01(v) {
+      return Math.max(0, Math.min(1, v));
+    }
+
+    function smoothstep(v) {
+      const t = clamp01(v);
+      return t * t * (CONFIG.smoothA - CONFIG.smoothB * t);
+    }
+
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    function hash2D(ix, iz) {
+      const h = Math.sin(ix * CONFIG.noiseHashX + iz * CONFIG.noiseHashZ) * CONFIG.noiseHashScale;
+      return h - Math.floor(h);
+    }
+
+    function valueNoise(x, z) {
+      const gx = x / CONFIG.terrainNoiseScale;
+      const gz = z / CONFIG.terrainNoiseScale;
+      const x0 = Math.floor(gx);
+      const z0 = Math.floor(gz);
+      const sx = smoothstep(gx - x0);
+      const sz = smoothstep(gz - z0);
+
+      const a = lerp(hash2D(x0, z0), hash2D(x0 + 1, z0), sx);
+      const b = lerp(hash2D(x0, z0 + 1), hash2D(x0 + 1, z0 + 1), sx);
+      return lerp(a, b, sz) * CONFIG.two - 1;
+    }
+
+    function runwayInfluence(x, z) {
+      const halfW = CONFIG.runwayWidth * CONFIG.half;
+      const halfL = CONFIG.runwayLength * CONFIG.half;
+      const dx = Math.abs(x) - halfW;
+      const dz = Math.abs(z - CONFIG.runwayCenterZ) - halfL;
+      const edge = Math.max(dx, dz);
+
+      if (edge <= 0) return 1;
+      if (edge >= CONFIG.runwayFlattenBlendDistance) return 0;
+      return smoothstep(1 - edge / CONFIG.runwayFlattenBlendDistance);
+    }
+
+    function getTerrainHeight(x, z) {
+      const waveA = Math.sin(
+        x * CONFIG.terrainFrequency +
+        z * CONFIG.terrainFrequency * CONFIG.terrainCrossFrequencyFactor
+      );
+      const waveB = Math.cos(
+        z * CONFIG.terrainFrequency * CONFIG.terrainSecondaryFrequencyFactor +
+        x * CONFIG.terrainFrequency * CONFIG.terrainSecondaryCrossFactor
+      );
+      const hills = (
+        waveA * CONFIG.terrainSineWeight +
+        waveB * CONFIG.terrainCosineWeight +
+        valueNoise(x, z) * CONFIG.terrainNoiseWeight
+      ) * CONFIG.terrainHeightScale;
+
+      return lerp(hills, CONFIG.runwayElevation, runwayInfluence(x, z));
+    }
+
+    function rand01(seed) {
+      const h = Math.sin(seed * CONFIG.randomHashFactor) * CONFIG.randomHashScale;
+      return h - Math.floor(h);
+    }
+
+    function randRange(seed, min, max) {
+      return lerp(min, max, rand01(seed));
+    }
+
+    function mat(color) {
+      return new THREE.MeshLambertMaterial({ color });
+    }
+
+    function nearRunway(x, z, margin) {
+      return Math.abs(x) < CONFIG.runwayWidth * CONFIG.half + margin &&
+             Math.abs(z - CONFIG.runwayCenterZ) < CONFIG.runwayLength * CONFIG.half + margin;
+    }
+
+    function shadowed(mesh, cast, receive) {
+      mesh.castShadow = cast;
+      mesh.receiveShadow = receive;
+      return mesh;
+    }
+
+    function createTerrain() {
+      const geo = new THREE.PlaneGeometry(
+        CONFIG.worldSize,
+        CONFIG.worldSize,
+        CONFIG.terrainSegments,
+        CONFIG.terrainSegments
+      );
+      geo.rotateX(-CONFIG.rightAngle);
+
+      const p = geo.attributes.position;
+      for (let i = 0; i < p.count; i += 1) {
+        p.setY(i, getTerrainHeight(p.getX(i), p.getZ(i)));
+      }
+      geo.computeVertexNormals();
+
+      scene.add(shadowed(new THREE.Mesh(geo, mat(CONFIG.colors.terrain)), false, true));
+    }
+
+    function createRunway() {
+      const y = CONFIG.runwayElevation +
+        CONFIG.runwaySurfaceOffset +
+        CONFIG.runwayThickness * CONFIG.half;
+
+      const runway = new THREE.Mesh(
+        new THREE.BoxGeometry(CONFIG.runwayWidth, CONFIG.runwayThickness, CONFIG.runwayLength),
+        mat(CONFIG.colors.runway)
+      );
+      runway.position.set(0, y, CONFIG.runwayCenterZ);
+      scene.add(shadowed(runway, false, true));
+
+      const spacing = CONFIG.runwayStripeLength + CONFIG.runwayStripeGap;
+      const usable = CONFIG.runwayLength - CONFIG.runwayStripeInset * CONFIG.two;
+      const count = Math.floor(usable / spacing);
+      const firstZ = CONFIG.runwayCenterZ - usable * CONFIG.half + CONFIG.runwayStripeLength * CONFIG.half;
+      const stripeY = CONFIG.runwayElevation +
+        CONFIG.runwaySurfaceOffset +
+        CONFIG.runwayThickness +
+        CONFIG.runwayStripeThickness * CONFIG.half;
+
+      for (let i = 0; i < count; i += 1) {
+        const stripe = new THREE.Mesh(
+          new THREE.BoxGeometry(CONFIG.runwayStripeWidth, CONFIG.runwayStripeThickness, CONFIG.runwayStripeLength),
+          mat(CONFIG.colors.stripe)
+        );
+        stripe.position.set(0, stripeY, firstZ + i * spacing);
+        scene.add(shadowed(stripe, false, true));
+      }
+    }
+
+    function createScenery() {
+      const trunkGeo = new THREE.CylinderGeometry(
+        CONFIG.treeTrunkRadius,
+        CONFIG.treeTrunkRadius,
+        CONFIG.treeTrunkHeight,
+        CONFIG.treeSegments
+      );
+      const leafGeo = new THREE.ConeGeometry(
+        CONFIG.treeFoliageRadius,
+        CONFIG.treeFoliageHeight,
+        CONFIG.treeSegments
+      );
+
+      const trunkMat = mat(CONFIG.colors.trunk);
+      const leafMat = mat(CONFIG.colors.foliage);
+      const buildingMat = mat(CONFIG.colors.building);
+      const mountainMat = mat(CONFIG.colors.mountain);
+
+      for (let i = 0; i < CONFIG.treeCount; i += 1) {
+        const seed = CONFIG.treeSeedOffset + i;
+        const x = (rand01(seed + CONFIG.randomSaltX) - CONFIG.half) * CONFIG.worldSize;
+        const z = (rand01(seed + CONFIG.randomSaltZ) - CONFIG.half) * CONFIG.worldSize;
+        if (nearRunway(x, z, CONFIG.treeAvoidRunwayMargin)) continue;
+
+        const s = randRange(seed + CONFIG.randomSaltScale, CONFIG.treeScaleMin, CONFIG.treeScaleMax);
+        const g = new THREE.Group();
+
+        const trunk = shadowed(new THREE.Mesh(trunkGeo, trunkMat), true, false);
+        trunk.scale.set(s, s, s);
+        trunk.position.y = CONFIG.treeTrunkHeight * s * CONFIG.half;
+
+        const leaf = shadowed(new THREE.Mesh(leafGeo, leafMat), true, true);
+        leaf.scale.set(s, s, s);
+        leaf.position.y = CONFIG.treeTrunkHeight * s + CONFIG.treeFoliageHeight * s * CONFIG.half;
+
+        g.add(trunk, leaf);
+        g.position.set(x, getTerrainHeight(x, z), z);
+        scene.add(g);
+      }
+
+      for (let i = 0; i < CONFIG.buildingCount; i += 1) {
+        const seed = CONFIG.buildingSeedOffset + i;
+        const x = (rand01(seed + CONFIG.randomSaltX) - CONFIG.half) * CONFIG.worldSize;
+        const z = (rand01(seed + CONFIG.randomSaltZ) - CONFIG.half) * CONFIG.worldSize;
+        if (nearRunway(x, z, CONFIG.buildingAvoidRunwayMargin)) continue;
+
+        const w = randRange(seed, CONFIG.buildingWidthMin, CONFIG.buildingWidthMax);
+        const d = randRange(seed + CONFIG.randomSaltZ, CONFIG.buildingDepthMin, CONFIG.buildingDepthMax);
+        const h = randRange(seed + CONFIG.randomSaltScale, CONFIG.buildingHeightMin, CONFIG.buildingHeightMax);
+
+        const b = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), buildingMat);
+        b.position.set(x, getTerrainHeight(x, z) + h * CONFIG.half, z);
+        scene.add(shadowed(b, true, true));
+      }
+
+      for (let i = 0; i < CONFIG.mountainCount; i += 1) {
+        const seed = CONFIG.mountainSeedOffset + i;
+        const angle = rand01(seed) * CONFIG.fullCircle;
+        const x = Math.cos(angle) * CONFIG.worldSize * CONFIG.mountainRadiusFactor;
+        const z = Math.sin(angle) * CONFIG.worldSize * CONFIG.mountainRadiusFactor;
+        const r = randRange(seed + CONFIG.randomSaltX, CONFIG.mountainRadiusMin, CONFIG.mountainRadiusMax);
+        const h = randRange(seed + CONFIG.randomSaltScale, CONFIG.mountainHeightMin, CONFIG.mountainHeightMax);
+
+        const m = new THREE.Mesh(new THREE.ConeGeometry(r, h, CONFIG.mountainSegments), mountainMat);
+        m.position.set(x, getTerrainHeight(x, z) + h * CONFIG.half, z);
+        scene.add(shadowed(m, true, true));
+      }
+    }
+
+    createTerrain();
+    createRunway();
+    createScenery();
+
+    // 5. Plane Construction
+    const plane = new THREE.Group();
+    const propeller = new THREE.Group();
+
+    function createPlane() {
+      const fuselage = new THREE.Mesh(
+        new THREE.BoxGeometry(CONFIG.fuselageWidth, CONFIG.fuselageHeight, CONFIG.fuselageLength),
+        mat(CONFIG.colors.fuselage)
+      );
+
+      const nose = new THREE.Mesh(
+        new THREE.ConeGeometry(CONFIG.noseRadius, CONFIG.noseLength, CONFIG.treeSegments),
+        mat(CONFIG.colors.nose)
+      );
+      nose.rotation.x = CONFIG.rightAngle;
+      nose.position.z = CONFIG.fuselageLength * CONFIG.half + CONFIG.noseLength * CONFIG.half;
+
+      const wing = new THREE.Mesh(
+        new THREE.BoxGeometry(CONFIG.wingSpan, CONFIG.wingThickness, CONFIG.wingChord),
+        mat(CONFIG.colors.wing)
+      );
+      wing.position.z = CONFIG.wingZ;
+
+      const tail = new THREE.Mesh(
+        new THREE.BoxGeometry(CONFIG.tailSpan, CONFIG.tailThickness, CONFIG.tailChord),
+        mat(CONFIG.colors.tail)
+      );
+      tail.position.set(0, CONFIG.fuselageHeight * CONFIG.half, CONFIG.tailZ);
+
+      const fin = new THREE.Mesh(
+        new THREE.BoxGeometry(CONFIG.finWidth, CONFIG.finHeight, CONFIG.finLength),
+        mat(CONFIG.colors.tail)
+      );
+      fin.position.set(0, CONFIG.finYOffset, CONFIG.tailZ);
+
+      const discMat = new THREE.MeshBasicMaterial({
+        color: CONFIG.colors.propellerDisc,
+        transparent: true,
+        opacity: CONFIG.propellerDiscOpacity,
+        depthWrite: false
+      });
+
+      const disc = new THREE.Mesh(
+        new THREE.CylinderGeometry(
+          CONFIG.propellerRadius,
+          CONFIG.propellerRadius,
+          CONFIG.propellerThickness,
+          CONFIG.treeSegments
+        ),
+        discMat
+      );
+      disc.rotation.x = CONFIG.rightAngle;
+
+      const bladeA = new THREE.Mesh(
+        new THREE.BoxGeometry(
+          CONFIG.propellerBladeLength,
+          CONFIG.propellerBladeWidth,
+          CONFIG.propellerBladeThickness
+        ),
+        mat(CONFIG.colors.propellerBlade)
+      );
+
+      const bladeB = bladeA.clone();
+      bladeB.rotation.z = CONFIG.rightAngle;
+
+      propeller.position.z = CONFIG.fuselageLength * CONFIG.half +
+        CONFIG.noseLength +
+        CONFIG.propellerForwardOffset;
+      propeller.add(disc, bladeA, bladeB);
+
+      plane.add(fuselage, nose, wing, tail, fin, propeller);
+      plane.traverse((o) => {
+        if (o.isMesh) {
+          o.castShadow = true;
+          o.receiveShadow = true;
+        }
+      });
+
+      scene.add(plane);
+    }
+
+    createPlane();
+
+    // 6. Input
+    const keys = {
+      KeyW: false,
+      KeyS: false,
+      KeyA: false,
+      KeyD: false,
+      KeyQ: false,
+      KeyE: false,
+      Space: false,
+      Shift: false
+    };
+
+    const handled = new Set([
+      'KeyW',
+      'KeyS',
+      'KeyA',
+      'KeyD',
+      'KeyQ',
+      'KeyE',
+      'Space',
+      'ShiftLeft',
+      'ShiftRight',
+      'KeyR'
+    ]);
+
+    function setKey(e, down) {
+      if (!handled.has(e.code)) return;
+      e.preventDefault();
+
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+        keys.Shift = down;
+        return;
+      }
+
+      if (e.code === 'KeyR' && down) {
+        resetPlane(true);
+        return;
+      }
+
+      if (e.code in keys) {
+        keys[e.code] = down;
+      }
+    }
+
+    window.addEventListener('keydown', (e) => setKey(e, true), { passive: false });
+    window.addEventListener('keyup', (e) => setKey(e, false), { passive: false });
+
+    // 7. State and Reset
+    const state = {
+      active: false,
+      crashed: false,
+      crashTimer: 0,
+      elapsed: 0,
+      position: new THREE.Vector3(),
+      velocity: new THREE.Vector3(),
+      orientation: new THREE.Quaternion(),
+      currentThrottle: 0,
+      targetThrottle: 0,
+      messageText: '',
+      messageTimer: 0,
+      messageKind: 'info'
+    };
+
+    const cameraLookTarget = new THREE.Vector3();
+    const cameraFollowQuat = new THREE.Quaternion();
+
+    function setMessage(text, duration, kind) {
+      state.messageText = text;
+      state.messageTimer = duration;
+      state.messageKind = kind;
+    }
+
+    function runwayStart() {
+      const z = CONFIG.runwayCenterZ - CONFIG.runwayLength * CONFIG.runwayStartOffsetFactor;
+      return new THREE.Vector3(0, getTerrainHeight(0, z) + CONFIG.planeGroundClearance, z);
+    }
+
+    function syncPlane() {
+      plane.position.copy(state.position);
+      plane.quaternion.copy(state.orientation);
+    }
+
+    function resetPlane(showMessage) {
+      const keepActive = state.active;
+
+      state.crashed = false;
+      state.crashTimer = 0;
+      state.position.copy(runwayStart());
+      state.velocity.set(0, 0, 0);
+      state.orientation.identity();
+      state.currentThrottle = 0;
+      state.targetThrottle = 0;
+      state.messageText = '';
+      state.messageTimer = 0;
+      state.messageKind = 'info';
+      state.active = keepActive;
+
+      cameraFollowQuat.copy(state.orientation);
+      syncPlane();
+
+      if (showMessage) {
+        setMessage('Reset to runway', CONFIG.resetMessageDuration, 'reset');
+      }
+    }
+
+    el.startButton.addEventListener('click', () => {
+      state.active = true;
+      el.overlay.classList.add('hidden');
+    });
+
+    // 8. Physics Helpers
+    function forwardVector() {
+      return LOCAL_FORWARD.clone().applyQuaternion(state.orientation).normalize();
+    }
+
+    function upVector() {
+      return LOCAL_UP.clone().applyQuaternion(state.orientation).normalize();
+    }
+
+    function rightVector() {
+      return LOCAL_RIGHT.clone().applyQuaternion(state.orientation).normalize();
+    }
+
+    function pitchRadians() {
+      const f = forwardVector();
+      return Math.asin(Math.max(CONFIG.signedUnitMin, Math.min(1, f.y)));
+    }
+
+    function rollRadians() {
+      const r = rightVector();
+      const u = upVector();
+      return Math.atan2(r.y, u.y);
+    }
+
+    function updateThrottle(dt) {
+      if (keys.Space) {
+        state.targetThrottle += CONFIG.throttleRate * dt;
+      }
+      if (keys.Shift) {
+        state.targetThrottle -= CONFIG.throttleRate * dt;
+      }
+
+      state.targetThrottle = clamp01(state.targetThrottle);
+
+      const maxStep = CONFIG.throttleRate * dt;
+      const diff = state.targetThrottle - state.currentThrottle;
+      state.currentThrottle += Math.abs(diff) <= maxStep ? diff : Math.sign(diff) * maxStep;
+    }
+
+    function getControlAuthority() {
+      // Near zero while parked, easing to full authority as airspeed rises.
+      return smoothstep(state.velocity.length() / CONFIG.controlAuthorityMinSpeed);
+    }
+
+    // 9. Physics Step
+    function applyRotationalControls(dt) {
+      const authority = getControlAuthority();
+      const pitchInput = (keys.KeyS ? 1 : 0) - (keys.KeyW ? 1 : 0);
+      const rollInput = (keys.KeyA ? 1 : 0) - (keys.KeyD ? 1 : 0);
+      const yawInput = (keys.KeyE ? 1 : 0) - (keys.KeyQ ? 1 : 0);
+
+      // Local-space pitch/roll/yaw are integrated with quaternion multiplication, not Euler angles.
+      // With forward = +Z, positive local X noses down, so pitch-up input is negated.
+      if (pitchInput !== 0) {
+        state.orientation.multiply(
+          new THREE.Quaternion().setFromAxisAngle(
+            LOCAL_RIGHT,
+            -pitchInput * CONFIG.pitchSpeed * authority * dt
+          )
+        );
+      }
+
+      // Positive local Z roll tilts left; A rolls left and D rolls right.
+      if (rollInput !== 0) {
+        state.orientation.multiply(
+          new THREE.Quaternion().setFromAxisAngle(
+            LOCAL_FORWARD,
+            rollInput * CONFIG.rollSpeed * authority * dt
+          )
+        );
+      }
+
+      // Positive local Y yaw turns right; Q/E provide small arcade heading nudges.
+      if (yawInput !== 0) {
+        state.orientation.multiply(
+          new THREE.Quaternion().setFromAxisAngle(
+            LOCAL_UP,
+            yawInput * CONFIG.yawSpeed * authority * dt
+          )
+        );
+      }
+
+      state.orientation.normalize();
+    }
+
+    function applyFlightForces(dt) {
+      const f = forwardVector();
+      const u = upVector();
+
+      // Thrust is simple arcade acceleration along the plane's local forward axis.
+      state.velocity.addScaledVector(f, CONFIG.acceleration * state.currentThrottle * dt);
+
+      const speed = state.velocity.length();
+      if (speed > 0) {
+        // Quadratic drag: drag acceleration is proportional to speed².
+        // Clamp the drag delta so it slows the plane without reversing it in one frame.
+        const dragAccel = CONFIG.dragCoefficient * speed * speed;
+        const dragDelta = Math.min(dragAccel * dt, speed);
+        state.velocity.addScaledVector(state.velocity.clone().normalize(), -dragDelta);
+      }
+
+      const forwardSpeed = Math.max(0, state.velocity.dot(f));
+      const stallRatio = clamp01(forwardSpeed / CONFIG.stallSpeed);
+
+      // Stall falloff: below stallSpeed, lift is multiplied by ratio², collapsing sharply near zero.
+      const stallFactor = forwardSpeed < CONFIG.stallSpeed ? stallRatio * stallRatio : 1;
+      const liftAccel = CONFIG.liftCoefficient * forwardSpeed * forwardSpeed * stallFactor;
+      state.velocity.addScaledVector(u, liftAccel * dt);
+
+      // Gravity is constant world-space downward acceleration.
+      state.velocity.y -= CONFIG.gravity * dt;
+
+      const after = state.velocity.length();
+      if (after > CONFIG.maxSpeed) {
+        state.velocity.multiplyScalar(CONFIG.maxSpeed / after);
+      }
+    }
+
+    function triggerCrash() {
+      if (state.crashed) return;
+
+      state.crashed = true;
+      state.crashTimer = CONFIG.crashMessageDuration;
+      state.velocity.set(0, 0, 0);
+      setMessage('Crash! Resetting...', CONFIG.crashMessageDuration, 'crash');
+    }
+
+    function handleGroundContact() {
+      const terrainY = getTerrainHeight(state.position.x, state.position.z);
+      const contactY = terrainY + CONFIG.planeGroundClearance;
+
+      if (state.position.y > contactY + CONFIG.groundContactEpsilon) return;
+
+      const tooFastDown = state.velocity.y < -CONFIG.crashVerticalSpeed;
+      const tooMuchPitch = Math.abs(pitchRadians()) > THREE.MathUtils.degToRad(CONFIG.crashImpactAngle);
+      const tooMuchRoll = Math.abs(rollRadians()) > THREE.MathUtils.degToRad(CONFIG.crashImpactAngle);
+
+      // Ground contact crashes only on hard downward impact or non-level attitude.
+      if (tooFastDown || tooMuchPitch || tooMuchRoll) {
+        triggerCrash();
+        return;
+      }
+
+      // Soft landing: clamp to terrain and zero only the downward vertical velocity component.
+      state.position.y = Math.max(state.position.y, contactY);
+      if (state.velocity.y < 0) {
+        state.velocity.y = 0;
+      }
+    }
+
+    function handleWorldBounds() {
+      const halfWorld = CONFIG.worldSize * CONFIG.half;
+
+      if (Math.abs(state.position.x) <= halfWorld && Math.abs(state.position.z) <= halfWorld) {
+        return;
+      }
+
+      resetPlane(false);
+      setMessage('Out of bounds — returned to runway', CONFIG.resetMessageDuration, 'reset');
+    }
+
+    function stepPhysics(dt) {
+      if (!state.active) return;
+
+      if (state.crashed) {
+        state.crashTimer -= dt;
+        if (state.crashTimer <= 0) {
+          resetPlane(false);
+        }
+        syncPlane();
+        return;
+      }
+
+      updateThrottle(dt);
+      applyRotationalControls(dt);
+      applyFlightForces(dt);
+      state.position.addScaledVector(state.velocity, dt);
+      handleGroundContact();
+
+      if (!state.crashed) {
+        handleWorldBounds();
+      }
+
+      syncPlane();
+    }
+
+    // 10. Camera Update
+    function updateSun() {
+      sun.position.set(
+        state.position.x + CONFIG.sunOffset.x,
+        state.position.y + CONFIG.sunOffset.y,
+        state.position.z + CONFIG.sunOffset.z
+      );
+      sun.target.position.copy(state.position);
+      sun.target.updateMatrixWorld();
+    }
+
+    function desiredCameraPosition() {
+      const offset = new THREE.Vector3(
+        CONFIG.cameraOffset.x,
+        CONFIG.cameraOffset.y,
+        CONFIG.cameraOffset.z
+      );
+
+      // Local offset uses a smoothed aircraft quaternion to avoid roll-induced camera snapping.
+      return state.position.clone().add(offset.applyQuaternion(cameraFollowQuat));
+    }
+
+    function updateCamera(dt) {
+      const alpha = 1 - Math.pow(1 - CONFIG.cameraLerpFactor, dt * CONFIG.referenceFrameRate);
+
+      cameraFollowQuat.slerp(state.orientation, alpha);
+      camera.position.lerp(desiredCameraPosition(), alpha);
+
+      const target = state.position.clone()
+        .addScaledVector(forwardVector(), CONFIG.cameraLookAhead)
+        .addScaledVector(WORLD_UP, CONFIG.cameraLookUpBias);
+
+      cameraLookTarget.lerp(target, alpha);
+      camera.up.copy(WORLD_UP);
+      camera.lookAt(cameraLookTarget);
+    }
+
+    function snapCamera() {
+      cameraFollowQuat.copy(state.orientation);
+      camera.position.copy(desiredCameraPosition());
+      cameraLookTarget.copy(
+        state.position.clone()
+          .addScaledVector(forwardVector(), CONFIG.cameraLookAhead)
+          .addScaledVector(WORLD_UP, CONFIG.cameraLookUpBias)
+      );
+      camera.lookAt(cameraLookTarget);
+      updateSun();
+    }
+
+    // 11. HUD Update
+    function updateHUD(dt) {
+      state.elapsed += dt;
+
+      const speed = state.velocity.length();
+      const terrainY = getTerrainHeight(state.position.x, state.position.z);
+      const agl = Math.max(0, state.position.y - terrainY - CONFIG.planeGroundClearance);
+
+      el.speed.textContent = (speed * CONFIG.speedToKmh).toFixed(CONFIG.hudDecimals);
+      el.altitude.textContent = agl.toFixed(CONFIG.hudDecimals);
+      el.throttle.textContent = (state.currentThrottle * CONFIG.throttlePercentScale).toFixed(CONFIG.hudDecimals);
+      el.pitch.textContent = THREE.MathUtils.radToDeg(pitchRadians()).toFixed(CONFIG.hudDecimals);
+
+      const stall = state.active &&
+        !state.crashed &&
+        speed < CONFIG.stallSpeed * CONFIG.stallWarningMargin;
+
+      const flashOn = Math.sin(state.elapsed * CONFIG.fullCircle / CONFIG.stallFlashInterval) > 0;
+      el.stall.textContent = stall && flashOn ? 'STALL' : '';
+
+      if (state.messageTimer > 0) {
+        state.messageTimer = Math.max(0, state.messageTimer - dt);
+      }
+
+      el.message.textContent = state.messageText;
+      el.message.className = state.messageTimer > 0 ? `visible ${state.messageKind}` : state.messageKind;
+    }
+
+    // 12. Main Loop
+    function updatePropeller(dt) {
+      if (!state.active || state.crashed) return;
+
+      propeller.rotation.z += (
+        CONFIG.propellerIdleSpin +
+        state.currentThrottle * CONFIG.propellerThrottleSpin
+      ) * dt;
+    }
+
+    let lastTime = performance.now();
+
+    function loop(now) {
+      const dt = Math.min(
+        (now - lastTime) / CONFIG.millisecondsPerSecond,
+        CONFIG.maxDeltaTime
+      );
+      lastTime = now;
+
+      stepPhysics(dt);
+      updatePropeller(dt);
+      updateCamera(dt);
+      updateSun();
+      updateHUD(dt);
+      renderer.render(scene, camera);
+
+      requestAnimationFrame(loop);
+    }
+
+    resetPlane(false);
+    snapCamera();
+    updateHUD(0);
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
