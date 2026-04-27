@@ -1,0 +1,1598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Mias in the City</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #10131d;
+    display: grid;
+    place-items: center;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: white;
+    overflow: hidden;
+  }
+  canvas {
+    width: min(100vw, 1024px);
+    height: auto;
+    max-height: 100vh;
+    background: #76a7ff;
+    box-shadow: 0 18px 50px rgba(0,0,0,.45);
+    image-rendering: crisp-edges;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="1024" height="576"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  const CANVAS_WIDTH = 1024;
+  const CANVAS_HEIGHT = 576;
+  const LEVEL_WIDTH = 3500;
+  const LEVEL_HEIGHT = 576;
+
+  const STATES = {
+    START: 'start',
+    PLAYING: 'playing',
+    PAUSED: 'paused',
+    GAME_OVER: 'gameOver',
+    VICTORY: 'victory'
+  };
+
+  const PLAYER = {
+    W: 34,
+    H: 52,
+    GRAVITY: 1900,
+    MAX_FALL_SPEED: 1050,
+    ACCEL: 2600,
+    FRICTION: 2500,
+    MAX_SPEED: 315,
+    JUMP_VELOCITY: -800,
+    JUMP_CUT: 0.45,
+    COYOTE_TIME: 0.10,
+    JUMP_BUFFER: 0.12
+  };
+
+  const JETPACK = {
+    DURATION: 20,
+    THRUST: 2850,
+    MAX_UP_SPEED: -620,
+    SPAWN_MIN: 8,
+    SPAWN_MAX: 15,
+    CLOVER_LIFETIME: 18,
+    PARTICLE_INTERVAL: 0.025
+  };
+
+  const TIMER = {
+    LIMIT: 45,
+    WARNING_AT: 15,
+    BLINKS_PER_SECOND: 4
+  };
+
+  const REQUIRED_COINS = 25;
+  const MAX_RESPAWNS_PER_CHECKPOINT = 5;
+  const DEATH_DELAY = 0.68;
+
+  const KEYS = {
+    LEFT: ['ArrowLeft', 'KeyA'],
+    RIGHT: ['ArrowRight', 'KeyD'],
+    JUMP: ['Space', 'ArrowUp', 'KeyW'],
+    PAUSE: ['KeyP', 'Escape']
+  };
+
+  const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const aabb = (a, b) =>
+    a.x < b.x + b.w &&
+    a.x + a.w > b.x &&
+    a.y < b.y + b.h &&
+    a.y + a.h > b.y;
+
+  const drawRoundRect = (ctx, x, y, w, h, r) => {
+    const rr = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
+    ctx.closePath();
+  };
+
+  const makeRng = (seed = 12345) => () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+
+  class AudioManager {
+    constructor() {
+      this.ctx = null;
+    }
+
+    init() {
+      if (!this.ctx) {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContext) return;
+        this.ctx = new AudioContext();
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume();
+    }
+
+    tone(freq, duration, type = 'sine', gain = 0.05, delay = 0, endFreq = null) {
+      if (!this.ctx) return;
+      const now = this.ctx.currentTime + delay;
+      const osc = this.ctx.createOscillator();
+      const amp = this.ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, now);
+      if (endFreq) osc.frequency.exponentialRampToValueAtTime(Math.max(1, endFreq), now + duration);
+      amp.gain.setValueAtTime(0.0001, now);
+      amp.gain.exponentialRampToValueAtTime(gain, now + 0.012);
+      amp.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+      osc.connect(amp);
+      amp.connect(this.ctx.destination);
+      osc.start(now);
+      osc.stop(now + duration + 0.03);
+    }
+
+    playJump() {
+      this.tone(330, 0.13, 'triangle', 0.055, 0, 760);
+    }
+
+    playCoin() {
+      this.tone(880, 0.07, 'sine', 0.05, 0, 1180);
+      this.tone(1320, 0.08, 'sine', 0.045, 0.075, 1600);
+    }
+
+    playClover() {
+      this.tone(523, 0.09, 'triangle', 0.045, 0, 784);
+      this.tone(659, 0.09, 'triangle', 0.045, 0.08, 988);
+      this.tone(1046, 0.12, 'sine', 0.04, 0.17, 1318);
+    }
+
+    playTimerWarning() {
+      this.tone(880, 0.12, 'square', 0.05, 0, 660);
+      this.tone(880, 0.12, 'square', 0.05, 0.18, 660);
+      this.tone(880, 0.16, 'square', 0.055, 0.36, 520);
+    }
+
+    playTimeUp() {
+      this.tone(300, 0.35, 'sawtooth', 0.06, 0, 70);
+      this.tone(90, 0.18, 'square', 0.045, 0.32, 45);
+    }
+
+    playStomp() {
+      this.tone(150, 0.12, 'square', 0.06, 0, 70);
+    }
+
+    playWake() {
+      this.tone(260, 0.08, 'sawtooth', 0.035, 0, 390);
+      this.tone(195, 0.08, 'sawtooth', 0.03, 0.09, 260);
+    }
+
+    playDeath() {
+      this.tone(420, 0.45, 'sawtooth', 0.055, 0, 75);
+    }
+
+    playVictory() {
+      const notes = [523, 659, 784, 1046, 784, 1046];
+      notes.forEach((note, i) => this.tone(note, 0.12, 'triangle', 0.055, i * 0.13, note * 1.04));
+    }
+  }
+
+  class InputHandler {
+    constructor(onFirstInteraction) {
+      this.keys = new Set();
+      this.pressed = new Set();
+      this.released = new Set();
+      this.onFirstInteraction = onFirstInteraction;
+      this.handledInteraction = false;
+
+      const primeAudio = () => {
+        if (!this.handledInteraction) {
+          this.handledInteraction = true;
+          this.onFirstInteraction?.();
+        } else {
+          this.onFirstInteraction?.();
+        }
+      };
+
+      window.addEventListener('keydown', (event) => {
+        if ([...KEYS.LEFT, ...KEYS.RIGHT, ...KEYS.JUMP, ...KEYS.PAUSE].includes(event.code)) {
+          event.preventDefault();
+        }
+        primeAudio();
+        if (!this.keys.has(event.code)) this.pressed.add(event.code);
+        this.keys.add(event.code);
+      });
+
+      window.addEventListener('keyup', (event) => {
+        if ([...KEYS.LEFT, ...KEYS.RIGHT, ...KEYS.JUMP, ...KEYS.PAUSE].includes(event.code)) {
+          event.preventDefault();
+        }
+        this.keys.delete(event.code);
+        this.released.add(event.code);
+      });
+
+      window.addEventListener('pointerdown', primeAudio);
+      window.addEventListener('touchstart', primeAudio, { passive: true });
+    }
+
+    isDown(codes) {
+      return codes.some((code) => this.keys.has(code));
+    }
+
+    wasPressed(codes) {
+      return codes.some((code) => this.pressed.has(code));
+    }
+
+    wasReleased(codes) {
+      return codes.some((code) => this.released.has(code));
+    }
+
+    endFrame() {
+      this.pressed.clear();
+      this.released.clear();
+    }
+  }
+
+  class Camera {
+    constructor(width, height, levelWidth, levelHeight) {
+      this.x = 0;
+      this.y = 0;
+      this.w = width;
+      this.h = height;
+      this.levelWidth = levelWidth;
+      this.levelHeight = levelHeight;
+      this.deadZoneW = 190;
+      this.deadZoneH = 110;
+    }
+
+    snapTo(target) {
+      this.x = clamp(target.centerX - this.w / 2, 0, this.levelWidth - this.w);
+      this.y = clamp(target.centerY - this.h / 2, 0, Math.max(0, this.levelHeight - this.h));
+    }
+
+    update(dt, target) {
+      let targetX = this.x;
+      let targetY = this.y;
+      const screenX = target.centerX - this.x;
+      const screenY = target.centerY - this.y;
+      const leftEdge = this.w / 2 - this.deadZoneW / 2;
+      const rightEdge = this.w / 2 + this.deadZoneW / 2;
+      const topEdge = this.h / 2 - this.deadZoneH / 2;
+      const bottomEdge = this.h / 2 + this.deadZoneH / 2;
+
+      // Dead-zone camera: only move when Mias leaves the small box around screen center.
+      if (screenX < leftEdge) targetX = target.centerX - leftEdge;
+      if (screenX > rightEdge) targetX = target.centerX - rightEdge;
+      if (screenY < topEdge) targetY = target.centerY - topEdge;
+      if (screenY > bottomEdge) targetY = target.centerY - bottomEdge;
+
+      const smoothing = 1 - Math.exp(-9 * dt);
+      this.x = clamp(lerp(this.x, targetX, smoothing), 0, this.levelWidth - this.w);
+      this.y = clamp(lerp(this.y, targetY, smoothing), 0, Math.max(0, this.levelHeight - this.h));
+    }
+  }
+
+  class Platform {
+    constructor(x, y, w, h, kind = 'street') {
+      this.x = x;
+      this.y = y;
+      this.w = w;
+      this.h = h;
+      this.kind = kind;
+    }
+
+    update(dt) {}
+
+    draw(ctx) {
+      const isGround = this.kind === 'ground';
+      ctx.save();
+      ctx.fillStyle = isGround ? '#343944' : '#4b5260';
+      ctx.fillRect(this.x, this.y, this.w, this.h);
+      ctx.fillStyle = isGround ? '#7b7d83' : '#9aa1aa';
+      ctx.fillRect(this.x, this.y, this.w, 8);
+      ctx.fillStyle = isGround ? '#252933' : '#333a45';
+      ctx.fillRect(this.x, this.y + this.h - 8, this.w, 8);
+
+      ctx.strokeStyle = 'rgba(255,255,255,.11)';
+      ctx.lineWidth = 1;
+      for (let x = this.x + 22; x < this.x + this.w; x += 44) {
+        ctx.beginPath();
+        ctx.moveTo(x, this.y + 10);
+        ctx.lineTo(x - 14, this.y + this.h - 10);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+  }
+
+  class Particle {
+    constructor(x, y, vx, vy, life, color, size = 4, gravity = 500) {
+      this.x = x;
+      this.y = y;
+      this.vx = vx;
+      this.vy = vy;
+      this.life = life;
+      this.maxLife = life;
+      this.color = color;
+      this.size = size;
+      this.gravity = gravity;
+    }
+
+    update(dt) {
+      this.life -= dt;
+      this.vy += this.gravity * dt;
+      this.x += this.vx * dt;
+      this.y += this.vy * dt;
+    }
+
+    draw(ctx) {
+      const alpha = clamp(this.life / this.maxLife, 0, 1);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = this.color;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.size * alpha, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  class Coin {
+    constructor(x, y) {
+      this.x = x;
+      this.y = y;
+      this.r = 9;
+      this.collected = false;
+      this.spin = Math.random() * Math.PI * 2;
+    }
+
+    get rect() {
+      return { x: this.x - this.r, y: this.y - this.r, w: this.r * 2, h: this.r * 2 };
+    }
+
+    update(dt) {
+      this.spin += dt * 7;
+    }
+
+    draw(ctx) {
+      if (this.collected) return;
+      const bob = Math.sin(this.spin * 1.4) * 2.2;
+      const squash = 0.58 + Math.abs(Math.cos(this.spin)) * 0.42;
+      ctx.save();
+      ctx.translate(this.x, this.y + bob);
+      ctx.scale(squash, 1);
+      ctx.fillStyle = '#ffd22e';
+      ctx.strokeStyle = '#9f6b00';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, this.r, this.r * 1.12, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#fff3a8';
+      ctx.fillRect(-2, -6, 4, 12);
+      ctx.restore();
+    }
+  }
+
+
+  class Clover {
+    constructor(x, y, lifetime = JETPACK.CLOVER_LIFETIME) {
+      this.x = x;
+      this.y = y;
+      this.r = 16;
+      this.life = lifetime;
+      this.maxLife = lifetime;
+      this.spin = Math.random() * Math.PI * 2;
+      this.collected = false;
+    }
+
+    get rect() {
+      return { x: this.x - 17, y: this.y - 18, w: 34, h: 36 };
+    }
+
+    get expired() {
+      return this.life <= 0;
+    }
+
+    update(dt) {
+      this.life -= dt;
+      this.spin += dt * 4.2;
+    }
+
+    draw(ctx) {
+      if (this.collected) return;
+      const bob = Math.sin(this.spin * 1.5) * 3;
+      const pulse = 0.9 + Math.sin(this.spin * 2.3) * 0.08;
+      const blinkAlpha = this.life < 3 ? 0.35 + (Math.floor(this.life * 8) % 2) * 0.65 : 1;
+
+      ctx.save();
+      ctx.globalAlpha = blinkAlpha;
+      ctx.translate(this.x, this.y + bob);
+      ctx.scale(pulse, pulse);
+
+      ctx.fillStyle = 'rgba(81, 255, 126, .22)';
+      ctx.beginPath();
+      ctx.arc(0, 0, 25, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = '#176a2e';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(3, 5);
+      ctx.quadraticCurveTo(11, 16, 3, 23);
+      ctx.stroke();
+
+      // Four simple leaves make the clover readable without relying on emoji fonts.
+      for (let i = 0; i < 4; i++) {
+        ctx.save();
+        ctx.rotate((Math.PI / 2) * i + Math.PI / 4);
+        ctx.fillStyle = '#25d45f';
+        ctx.strokeStyle = '#0f7b32';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.ellipse(0, -9, 7, 10, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      ctx.fillStyle = '#e8ffb0';
+      ctx.beginPath();
+      ctx.arc(0, 0, 3.2, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 12px serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('✦', -18, -17);
+      ctx.restore();
+    }
+  }
+
+  class Checkpoint {
+    constructor(x, platform, index) {
+      this.x = x;
+      this.platform = platform;
+      this.index = index;
+      this.w = 48;
+      this.h = 104;
+      this.y = platform.y - this.h;
+      this.active = false;
+      this.spawnX = x + 12;
+      this.spawnY = platform.y - PLAYER.H;
+    }
+
+    get rect() {
+      return { x: this.x - 10, y: this.y, w: this.w + 20, h: this.h };
+    }
+
+    update(dt) {}
+
+    draw(ctx) {
+      ctx.save();
+      ctx.fillStyle = '#2e3138';
+      ctx.fillRect(this.x + 4, this.y + 10, 7, this.h - 10);
+      ctx.fillStyle = this.active ? '#44e082' : '#d54b4b';
+      drawRoundRect(ctx, this.x + 11, this.y + 15, 38, 30, 5);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,.75)';
+      ctx.font = 'bold 12px system-ui';
+      ctx.textAlign = 'center';
+      ctx.fillText('CP', this.x + 30, this.y + 35);
+      ctx.fillStyle = '#22242b';
+      ctx.fillRect(this.x - 3, this.y + this.h - 8, 22, 8);
+      ctx.restore();
+    }
+  }
+
+  class Flagpole {
+    constructor(x, platform) {
+      this.x = x;
+      this.platform = platform;
+      this.h = 215;
+      this.w = 54;
+      this.y = platform.y - this.h;
+      this.finished = false;
+    }
+
+    get rect() {
+      return { x: this.x - 18, y: this.y, w: this.w, h: this.h };
+    }
+
+    update(dt) {}
+
+    draw(ctx) {
+      ctx.save();
+      ctx.fillStyle = '#f1f5ff';
+      ctx.fillRect(this.x, this.y, 8, this.h);
+      ctx.fillStyle = '#f4c542';
+      ctx.beginPath();
+      ctx.arc(this.x + 4, this.y, 10, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#2bd46b';
+      ctx.beginPath();
+      ctx.moveTo(this.x + 8, this.y + 28);
+      ctx.lineTo(this.x + 76, this.y + 48);
+      ctx.lineTo(this.x + 8, this.y + 70);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#20242c';
+      ctx.fillRect(this.x - 8, this.platform.y - 12, 28, 12);
+      ctx.restore();
+    }
+  }
+
+  class Enemy {
+    constructor(game, x, platform, direction = 1) {
+      this.game = game;
+      this.platform = platform;
+      this.w = 42;
+      this.h = 34;
+      this.speed = 65;
+      this.initialX = x;
+      this.initialDirection = direction;
+      this.reset();
+    }
+
+    get rect() {
+      return { x: this.x, y: this.y, w: this.w, h: this.h };
+    }
+
+    reset() {
+      this.x = this.initialX;
+      this.y = this.platform.y - this.h;
+      this.direction = this.initialDirection;
+      this.state = 'walking';
+      this.stunTimer = 0;
+      this.alive = true;
+      this.squashTimer = 0;
+    }
+
+    stun() {
+      this.state = 'stunned';
+      this.stunTimer = 5.0;
+      this.squashTimer = 0.16;
+    }
+
+    kill() {
+      this.alive = false;
+      this.squashTimer = 0;
+    }
+
+    update(dt) {
+      if (!this.alive) return;
+      this.squashTimer = Math.max(0, this.squashTimer - dt);
+
+      if (this.state === 'stunned') {
+        this.stunTimer -= dt;
+        if (this.stunTimer <= 0) {
+          this.state = 'walking';
+          this.stunTimer = 0;
+          this.game.audio.playWake();
+        }
+        return;
+      }
+
+      this.x += this.direction * this.speed * dt;
+      const leftLimit = this.platform.x + 6;
+      const rightLimit = this.platform.x + this.platform.w - this.w - 6;
+
+      // Edge guard: monsters are tied to their own platform, so they turn before walking off.
+      if (this.x <= leftLimit) {
+        this.x = leftLimit;
+        this.direction = 1;
+      } else if (this.x >= rightLimit) {
+        this.x = rightLimit;
+        this.direction = -1;
+      }
+    }
+
+    draw(ctx) {
+      if (!this.alive) return;
+      const stunned = this.state === 'stunned';
+      const squash = this.squashTimer > 0 ? 1 - 0.25 * (this.squashTimer / 0.16) : 1;
+      ctx.save();
+      ctx.translate(this.x + this.w / 2, this.y + this.h);
+      ctx.scale(1, squash);
+
+      ctx.fillStyle = stunned ? '#7aa7ff' : '#9b3bd1';
+      ctx.strokeStyle = stunned ? '#2e4f9c' : '#3d185c';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(0, -17, 21, 17, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = stunned ? '#dce6ff' : '#f7f7ff';
+      ctx.beginPath();
+      ctx.arc(-8, -22, 5, 0, Math.PI * 2);
+      ctx.arc(8, -22, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#111';
+      ctx.beginPath();
+      ctx.arc(-8 + this.direction * 1.5, -22, 2, 0, Math.PI * 2);
+      ctx.arc(8 + this.direction * 1.5, -22, 2, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = '#28113a';
+      ctx.fillRect(-15, -4, 9, 5);
+      ctx.fillRect(6, -4, 9, 5);
+
+      if (stunned) {
+        ctx.fillStyle = '#fff370';
+        ctx.font = '16px serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('✦', 0, -39);
+      }
+      ctx.restore();
+    }
+  }
+
+  class Player {
+    constructor(game, x, y) {
+      this.game = game;
+      this.w = PLAYER.W;
+      this.h = PLAYER.H;
+      this.reset(x, y);
+    }
+
+    get rect() {
+      return { x: this.x, y: this.y, w: this.w, h: this.h };
+    }
+
+    get centerX() { return this.x + this.w / 2; }
+    get centerY() { return this.y + this.h / 2; }
+    get prevBottom() { return this.prevY + this.h; }
+
+    reset(x, y) {
+      this.x = x;
+      this.y = y;
+      this.prevX = x;
+      this.prevY = y;
+      this.vx = 0;
+      this.vy = 0;
+      this.facing = 1;
+      this.onGround = false;
+      this.coyoteTimer = 0;
+      this.jumpBufferTimer = 0;
+      this.anim = 0;
+      this.thrusting = false;
+      this.dead = false;
+      this.invulnerableTimer = 1.2;
+    }
+
+    jump() {
+      this.vy = PLAYER.JUMP_VELOCITY;
+      this.onGround = false;
+      this.coyoteTimer = 0;
+      this.jumpBufferTimer = 0;
+      this.game.audio.playJump();
+    }
+
+    bounce(power = -420) {
+      this.vy = power;
+      this.onGround = false;
+      this.coyoteTimer = 0;
+    }
+
+    update(dt) {
+      if (this.dead) return;
+      const input = this.game.input;
+      this.thrusting = false;
+      this.invulnerableTimer = Math.max(0, this.invulnerableTimer - dt);
+
+      if (this.onGround) this.coyoteTimer = PLAYER.COYOTE_TIME;
+      else this.coyoteTimer = Math.max(0, this.coyoteTimer - dt);
+
+      if (input.wasPressed(KEYS.JUMP)) this.jumpBufferTimer = PLAYER.JUMP_BUFFER;
+      else this.jumpBufferTimer = Math.max(0, this.jumpBufferTimer - dt);
+
+      const left = input.isDown(KEYS.LEFT);
+      const right = input.isDown(KEYS.RIGHT);
+      const move = (right ? 1 : 0) - (left ? 1 : 0);
+
+      if (move !== 0) {
+        this.vx += move * PLAYER.ACCEL * dt;
+        this.vx = clamp(this.vx, -PLAYER.MAX_SPEED, PLAYER.MAX_SPEED);
+        this.facing = move;
+      } else {
+        const friction = PLAYER.FRICTION * dt;
+        if (Math.abs(this.vx) <= friction) this.vx = 0;
+        else this.vx -= Math.sign(this.vx) * friction;
+      }
+
+      if (this.jumpBufferTimer > 0 && this.coyoteTimer > 0) this.jump();
+
+      // Variable jump height: releasing early cuts upward velocity.
+      if (input.wasReleased(KEYS.JUMP) && this.vy < 0) this.vy *= PLAYER.JUMP_CUT;
+
+      this.vy = clamp(this.vy + PLAYER.GRAVITY * dt, -9999, PLAYER.MAX_FALL_SPEED);
+      if (this.game.jetpackTimer > 0 && input.isDown(KEYS.JUMP)) {
+        // Jetpack overrides gravity only while jump is held, with a capped climb speed.
+        this.vy = clamp(this.vy - JETPACK.THRUST * dt, JETPACK.MAX_UP_SPEED, PLAYER.MAX_FALL_SPEED);
+        this.thrusting = true;
+      }
+      this.anim += dt * (Math.abs(this.vx) > 20 && this.onGround ? 14 : 4);
+    }
+
+    afterCollisions() {
+      // Jump buffering is consumed after the Y collision pass, so a pre-landing press fires on contact.
+      if (this.onGround && this.jumpBufferTimer > 0) {
+        this.jump();
+        if (!this.game.input.isDown(KEYS.JUMP) && this.vy < 0) this.vy *= PLAYER.JUMP_CUT;
+      }
+    }
+
+    draw(ctx) {
+      if (this.dead) return;
+      ctx.save();
+      if (this.invulnerableTimer > 0 && Math.floor(this.invulnerableTimer * 18) % 2 === 0) {
+        ctx.globalAlpha = 0.55;
+      }
+      ctx.translate(this.x + this.w / 2, this.y);
+      ctx.scale(this.facing, 1);
+
+      const legSwing = Math.sin(this.anim) * 3;
+      const jetpackVisible = this.game.jetpackTimer > 0 && !(this.game.jetpackTimer < 4 && Math.floor(this.game.jetpackTimer * 8) % 2 === 0);
+
+      if (jetpackVisible) {
+        ctx.fillStyle = '#707985';
+        ctx.strokeStyle = '#2b3441';
+        ctx.lineWidth = 2;
+        drawRoundRect(ctx, -28, 17, 13, 25, 4);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = '#ffcf4a';
+        ctx.fillRect(-25, 22, 7, 3);
+        ctx.fillRect(-25, 29, 7, 3);
+        ctx.fillStyle = '#202936';
+        ctx.fillRect(-31, 36, 8, 5);
+        if (this.thrusting) {
+          ctx.fillStyle = '#ff8b2e';
+          ctx.beginPath();
+          ctx.moveTo(-31, 39);
+          ctx.lineTo(-44, 44 + Math.sin(this.anim * 2) * 3);
+          ctx.lineTo(-31, 47);
+          ctx.closePath();
+          ctx.fill();
+          ctx.fillStyle = '#ffe65a';
+          ctx.beginPath();
+          ctx.moveTo(-31, 40);
+          ctx.lineTo(-39, 44);
+          ctx.lineTo(-31, 46);
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+
+      // Legs and shoes
+      ctx.fillStyle = '#1f5db8';
+      ctx.fillRect(-12, 29, 10, 18 + legSwing * 0.2);
+      ctx.fillRect(2, 29, 10, 18 - legSwing * 0.2);
+      ctx.fillStyle = '#5a351d';
+      drawRoundRect(ctx, -16, 45 + Math.max(0, legSwing), 15, 7, 3);
+      ctx.fill();
+      drawRoundRect(ctx, 1, 45 + Math.max(0, -legSwing), 15, 7, 3);
+      ctx.fill();
+
+      // Shirt, arms, overalls
+      ctx.fillStyle = '#f5f7ff';
+      drawRoundRect(ctx, -17, 17, 34, 23, 7);
+      ctx.fill();
+      ctx.fillStyle = '#1f5db8';
+      drawRoundRect(ctx, -13, 19, 26, 23, 5);
+      ctx.fill();
+      ctx.fillStyle = '#f4d09c';
+      ctx.beginPath();
+      ctx.arc(-19, 29, 5, 0, Math.PI * 2);
+      ctx.arc(19, 29, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffd54d';
+      ctx.beginPath();
+      ctx.arc(-6, 25, 2.2, 0, Math.PI * 2);
+      ctx.arc(6, 25, 2.2, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Head and cap
+      ctx.fillStyle = '#f4c792';
+      ctx.beginPath();
+      ctx.arc(0, 10, 12, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#df2d2d';
+      drawRoundRect(ctx, -13, -1, 26, 9, 5);
+      ctx.fill();
+      ctx.fillRect(2, 5, 16, 4);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 8px system-ui';
+      ctx.textAlign = 'center';
+      ctx.fillText('M', 0, 7);
+
+      // Eye, nose, moustache
+      ctx.fillStyle = '#151515';
+      ctx.beginPath();
+      ctx.arc(5, 10, 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#e5aa78';
+      ctx.beginPath();
+      ctx.arc(12, 15, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#101010';
+      ctx.beginPath();
+      ctx.ellipse(5, 18, 8, 3.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  class Game {
+    constructor(canvas) {
+      this.canvas = canvas;
+      this.ctx = canvas.getContext('2d');
+      this.audio = new AudioManager();
+      this.input = new InputHandler(() => this.audio.init());
+      this.camera = new Camera(CANVAS_WIDTH, CANVAS_HEIGHT, LEVEL_WIDTH, LEVEL_HEIGHT);
+      this.state = STATES.START;
+      this.lastTime = 0;
+      this.elapsed = 0;
+      this.message = null;
+      this.deathTimer = 0;
+      this.deathFlash = 0;
+      this.coinPopTimer = 0;
+      this.gameOverReason = 'Checkpoint respawns exhausted.';
+      this.levelWon = false;
+      this.buildBackground();
+      this.resetLevel();
+      requestAnimationFrame((time) => this.loop(time));
+    }
+
+    resetLevel() {
+      this.platforms = [];
+      this.coins = [];
+      this.enemies = [];
+      this.checkpoints = [];
+      this.particles = [];
+      this.coinCount = 0;
+      this.lastCheckpointIndex = -1;
+      this.checkpointDeaths = 0;
+      this.message = null;
+      this.deathTimer = 0;
+      this.deathFlash = 0;
+      this.coinPopTimer = 0;
+      this.clover = null;
+      this.cloverSpawnTimer = this.randomCloverDelay();
+      this.jetpackTimer = 0;
+      this.jetpackParticleTimer = 0;
+      this.timeLeft = TIMER.LIMIT;
+      this.warningTriggered = false;
+      this.gameOverReason = 'Checkpoint respawns exhausted.';
+      this.levelWon = false;
+      this.createLevel();
+      this.player = new Player(this, 80, 520 - PLAYER.H);
+      this.camera.snapTo(this.player);
+    }
+
+    createLevel() {
+      const addPlatform = (x, y, w, h, kind = 'street') => {
+        const platform = new Platform(x, y, w, h, kind);
+        this.platforms.push(platform);
+        return platform;
+      };
+
+      const g0 = addPlatform(0, 520, 620, 56, 'ground');
+      const g1 = addPlatform(720, 520, 330, 56, 'ground');
+      const g2 = addPlatform(1140, 520, 420, 56, 'ground');
+      const g3 = addPlatform(1660, 520, 360, 56, 'ground');
+      const g4 = addPlatform(2140, 520, 420, 56, 'ground');
+      const g5 = addPlatform(2680, 520, 340, 56, 'ground');
+      const g6 = addPlatform(3160, 520, 340, 56, 'ground');
+
+      const p0 = addPlatform(240, 430, 160, 24);
+      const p1 = addPlatform(520, 390, 140, 24);
+      const p2 = addPlatform(800, 445, 160, 24);
+      const p3 = addPlatform(980, 365, 145, 24);
+      const p4 = addPlatform(1220, 430, 180, 24);
+      const p5 = addPlatform(1450, 345, 160, 24);
+      const p6 = addPlatform(1740, 430, 150, 24);
+      const p7 = addPlatform(1900, 350, 160, 24);
+      const p8 = addPlatform(2220, 445, 180, 24);
+      const p9 = addPlatform(2460, 365, 145, 24);
+      const p10 = addPlatform(2730, 430, 160, 24);
+      const p11 = addPlatform(2920, 340, 190, 24);
+      const p12 = addPlatform(3230, 430, 140, 24);
+      const p13 = addPlatform(3380, 335, 115, 24);
+
+      const addCoin = (x, y) => this.coins.push(new Coin(x, y));
+      const addLine = (x, y, count, dx, dy = 0) => {
+        for (let i = 0; i < count; i++) addCoin(x + dx * i, y + dy * i);
+      };
+      const addArc = (cx, cy, rx, ry, count, start = Math.PI, end = Math.PI * 2) => {
+        for (let i = 0; i < count; i++) {
+          const t = count === 1 ? 0 : i / (count - 1);
+          const a = lerp(start, end, t);
+          addCoin(cx + Math.cos(a) * rx, cy + Math.sin(a) * ry);
+        }
+      };
+
+      addLine(130, 470, 8, 38);
+      addLine(268, 390, 5, 28);
+      addArc(630, 405, 80, 48, 6, Math.PI * 1.08, Math.PI * 1.92);
+      addLine(820, 407, 5, 30);
+      addArc(1040, 325, 82, 38, 7, Math.PI * 1.08, Math.PI * 1.92);
+      addLine(1210, 470, 8, 38);
+      addLine(1470, 305, 5, 28);
+      addLine(1755, 390, 5, 28);
+      addLine(1920, 310, 5, 28);
+      addArc(2080, 415, 82, 46, 6, Math.PI * 1.05, Math.PI * 1.95);
+      addLine(2240, 405, 5, 30);
+      addLine(2475, 325, 5, 28);
+      addLine(2748, 390, 5, 28);
+      addLine(2938, 300, 6, 28);
+      addArc(3110, 425, 95, 55, 7, Math.PI * 1.1, Math.PI * 1.9);
+      addLine(3246, 390, 5, 28);
+      addLine(3394, 295, 5, 22);
+      this.totalCoins = this.coins.length;
+
+      this.enemies.push(new Enemy(this, 782, g1, 1));
+      this.enemies.push(new Enemy(this, 1260, g2, -1));
+      this.enemies.push(new Enemy(this, 1748, p6, 1));
+      this.enemies.push(new Enemy(this, 1920, p7, -1));
+      this.enemies.push(new Enemy(this, 2240, g4, 1));
+      this.enemies.push(new Enemy(this, 2472, p9, 1));
+      this.enemies.push(new Enemy(this, 2750, p10, -1));
+      this.enemies.push(new Enemy(this, 2940, p11, 1));
+      this.enemies.push(new Enemy(this, 3220, g6, -1));
+      this.enemies.push(new Enemy(this, 3390, p13, -1));
+
+      this.checkpoints.push(new Checkpoint(1190, g2, 0));
+      this.checkpoints.push(new Checkpoint(2190, g4, 1));
+      this.checkpoints.push(new Checkpoint(3190, g6, 2));
+      this.flagpole = new Flagpole(3435, g6);
+    }
+
+    updateLevelTimer(dt) {
+      if (this.levelWon || this.state !== STATES.PLAYING) return;
+      const previousTime = this.timeLeft;
+      this.timeLeft = Math.max(0, this.timeLeft - dt);
+
+      // Warning phase triggers once when the countdown crosses 15 seconds.
+      if (!this.warningTriggered && previousTime > TIMER.WARNING_AT && this.timeLeft <= TIMER.WARNING_AT) {
+        this.warningTriggered = true;
+        this.audio.playTimerWarning();
+        this.message = { text: 'Hurry! 15 seconds left!', time: 1.5 };
+      }
+
+      if (this.timeLeft <= 0) this.triggerGameOver('time');
+    }
+
+    triggerGameOver(reason = 'respawns') {
+      this.deathTimer = 0;
+      this.deathFlash = 0;
+      this.jetpackTimer = 0;
+      this.clover = null;
+      this.player.dead = true;
+      this.gameOverReason = reason === 'time'
+        ? 'Time is up. Mias missed the deadline.'
+        : 'Checkpoint respawns exhausted.';
+      if (reason === 'time') this.audio.playTimeUp();
+      this.state = STATES.GAME_OVER;
+    }
+
+    randomCloverDelay() {
+      return JETPACK.SPAWN_MIN + Math.random() * (JETPACK.SPAWN_MAX - JETPACK.SPAWN_MIN);
+    }
+
+    updateJetpack(dt) {
+      if (this.jetpackTimer <= 0) return;
+      this.jetpackTimer = Math.max(0, this.jetpackTimer - dt);
+      if (this.jetpackTimer === 0) {
+        this.message = { text: 'Jetpack expired', time: 1.2 };
+        this.cloverSpawnTimer = this.randomCloverDelay();
+      }
+    }
+
+    updateClover(dt) {
+      if (this.jetpackTimer > 0) {
+        this.clover = null;
+        return;
+      }
+
+      if (this.clover) {
+        this.clover.update(dt);
+        if (this.clover.expired) {
+          this.clover = null;
+          this.cloverSpawnTimer = this.randomCloverDelay();
+        }
+        return;
+      }
+
+      this.cloverSpawnTimer -= dt;
+      if (this.cloverSpawnTimer <= 0) this.spawnClover();
+    }
+
+    spawnClover() {
+      const minX = clamp(this.player.x + 180, 0, LEVEL_WIDTH);
+      const maxX = clamp(this.player.x + 1100, 0, LEVEL_WIDTH);
+      let candidates = this.platforms.filter((platform) =>
+        platform.w >= 110 &&
+        platform.x + platform.w > minX &&
+        platform.x < maxX &&
+        platform.y >= 335 &&
+        platform.x > 60 &&
+        platform.x + platform.w < LEVEL_WIDTH - 30
+      );
+
+      if (!candidates.length) {
+        candidates = this.platforms.filter((platform) =>
+          platform.w >= 110 &&
+          platform.x + platform.w > this.camera.x - 200 &&
+          platform.x < this.camera.x + CANVAS_WIDTH + 850
+        );
+      }
+      if (!candidates.length) candidates = this.platforms.filter((platform) => platform.w >= 110);
+
+      const platform = candidates[Math.floor(Math.random() * candidates.length)];
+      const margin = Math.min(36, platform.w * 0.25);
+      const x = lerp(platform.x + margin, platform.x + platform.w - margin, Math.random());
+      this.clover = new Clover(x, platform.y - 33);
+      this.message = { text: 'Lucky clover appeared!', time: 1.35 };
+    }
+
+    handleClover() {
+      if (!this.clover || this.clover.collected || !aabb(this.player.rect, this.clover.rect)) return;
+      this.clover.collected = true;
+      this.activateJetpack(this.clover.x, this.clover.y);
+      this.clover = null;
+    }
+
+    activateJetpack(x, y) {
+      this.jetpackTimer = JETPACK.DURATION;
+      this.jetpackParticleTimer = 0;
+      this.cloverSpawnTimer = this.randomCloverDelay() + JETPACK.DURATION;
+      this.message = { text: 'Jetpack! Hold Jump to fly', time: 1.8 };
+      this.audio.playClover();
+      this.emitCloverParticles(x, y);
+    }
+
+    emitJetpackParticles(dt) {
+      if (this.jetpackTimer <= 0 || !this.player.thrusting || this.player.dead) return;
+      this.jetpackParticleTimer -= dt;
+      while (this.jetpackParticleTimer <= 0) {
+        this.jetpackParticleTimer += JETPACK.PARTICLE_INTERVAL;
+        const nozzleX = this.player.centerX - this.player.facing * 22;
+        const nozzleY = this.player.y + 39;
+        const vx = -this.player.facing * (35 + Math.random() * 70) + (Math.random() - 0.5) * 35;
+        const vy = 100 + Math.random() * 115;
+        const color = Math.random() > 0.45 ? '#ff9a2d' : '#ffe14d';
+        this.particles.push(new Particle(nozzleX, nozzleY, vx, vy, 0.22 + Math.random() * 0.12, color, 4 + Math.random() * 3, 280));
+      }
+    }
+
+    buildBackground() {
+      const rng = makeRng(42);
+      const makeLayer = (factor, baseY, minH, maxH, color, windowColor, stepMin, stepMax) => {
+        const buildings = [];
+        let x = -300;
+        while (x < LEVEL_WIDTH + 600) {
+          const w = Math.floor(lerp(stepMin, stepMax, rng()));
+          const h = Math.floor(lerp(minH, maxH, rng()));
+          const roof = rng() > 0.65 ? 'spire' : rng() > 0.5 ? 'flat' : 'antenna';
+          buildings.push({ x, y: baseY - h, w, h, color, windowColor, roof, lit: rng() > 0.45 });
+          x += w + Math.floor(lerp(8, 26, rng()));
+        }
+        return { factor, buildings, baseY };
+      };
+      this.bgLayers = [
+        makeLayer(0.2, 395, 130, 255, '#14223a', 'rgba(255,230,130,.22)', 70, 120),
+        makeLayer(0.5, 450, 150, 290, '#203653', 'rgba(255,238,150,.32)', 65, 105),
+        makeLayer(0.8, 520, 120, 245, '#2d425f', 'rgba(255,238,170,.40)', 55, 90)
+      ];
+    }
+
+    loop(time) {
+      const dt = Math.min((time - this.lastTime) / 1000 || 0, 1 / 30);
+      this.lastTime = time;
+      this.elapsed += dt;
+      this.update(dt);
+      this.draw();
+      this.input.endFrame();
+      requestAnimationFrame((nextTime) => this.loop(nextTime));
+    }
+
+    update(dt) {
+      // Small state machine. Each terminal/pause screen owns its own Space/P transition.
+      if (this.state === STATES.START) {
+        if (this.input.wasPressed(KEYS.JUMP)) {
+          this.resetLevel();
+          this.state = STATES.PLAYING;
+        }
+        return;
+      }
+
+      if (this.state === STATES.PLAYING && this.input.wasPressed(KEYS.PAUSE)) {
+        this.state = STATES.PAUSED;
+        return;
+      }
+
+      if (this.state === STATES.PAUSED) {
+        if (this.input.wasPressed(KEYS.PAUSE)) this.state = STATES.PLAYING;
+        return;
+      }
+
+      if (this.state === STATES.GAME_OVER || this.state === STATES.VICTORY) {
+        if (this.input.wasPressed(KEYS.JUMP)) {
+          this.resetLevel();
+          this.state = STATES.PLAYING;
+        }
+        return;
+      }
+
+      if (this.state === STATES.PLAYING) this.updatePlaying(dt);
+    }
+
+    updatePlaying(dt) {
+      this.message && (this.message.time -= dt);
+      if (this.message && this.message.time <= 0) this.message = null;
+      this.coinPopTimer = Math.max(0, this.coinPopTimer - dt);
+
+      this.updateLevelTimer(dt);
+      if (this.state !== STATES.PLAYING) return;
+
+      this.particles.forEach((p) => p.update(dt));
+      this.particles = this.particles.filter((p) => p.life > 0);
+
+      if (this.deathTimer > 0) {
+        this.deathTimer -= dt;
+        this.deathFlash = clamp(this.deathTimer / DEATH_DELAY, 0, 1);
+        this.camera.update(dt, this.player);
+        if (this.deathTimer <= 0) this.finishDeath();
+        return;
+      }
+
+      this.updateJetpack(dt);
+      this.updateClover(dt);
+
+      this.player.update(dt);
+      this.enemies.forEach((enemy) => enemy.update(dt));
+
+      this.movePlayerX(dt);
+      this.movePlayerY(dt);
+      this.player.afterCollisions();
+
+      this.handleEnemyCollisions();
+      if (this.deathTimer > 0) return;
+
+      this.handleCoins();
+      this.handleClover();
+      this.handleCheckpoints();
+      this.handleFlagpole();
+      this.emitJetpackParticles(dt);
+
+      if (this.player.y > CANVAS_HEIGHT + 120) this.triggerDeath('pit');
+
+      this.coins.forEach((coin) => coin.update(dt));
+      this.camera.update(dt, this.player);
+    }
+
+    movePlayerX(dt) {
+      const player = this.player;
+      player.prevX = player.x;
+      player.x += player.vx * dt;
+      player.x = clamp(player.x, 0, LEVEL_WIDTH - player.w);
+
+      for (const platform of this.platforms) {
+        if (!aabb(player.rect, platform)) continue;
+        // Resolve X separately from Y to prevent wall sticking and floor sinking.
+        if (player.vx > 0) player.x = platform.x - player.w;
+        else if (player.vx < 0) player.x = platform.x + platform.w;
+        player.vx = 0;
+      }
+    }
+
+    movePlayerY(dt) {
+      const player = this.player;
+      player.prevY = player.y;
+      player.y += player.vy * dt;
+      player.onGround = false;
+
+      for (const platform of this.platforms) {
+        if (!aabb(player.rect, platform)) continue;
+        if (player.vy > 0) {
+          player.y = platform.y - player.h;
+          player.vy = 0;
+          player.onGround = true;
+        } else if (player.vy < 0) {
+          player.y = platform.y + platform.h;
+          player.vy = 0;
+        }
+      }
+    }
+
+    handleEnemyCollisions() {
+      const player = this.player;
+      for (const enemy of this.enemies) {
+        if (!enemy.alive || !aabb(player.rect, enemy.rect)) continue;
+        const landedFromAbove = player.vy >= 0 && player.prevBottom <= enemy.y + 14;
+
+        if (landedFromAbove) {
+          const wasStunned = enemy.state === 'stunned';
+          player.y = enemy.y - player.h;
+          player.bounce(wasStunned ? -455 : -385);
+          this.audio.playStomp();
+          enemy.squashTimer = 0.16;
+
+          if (wasStunned) {
+            enemy.kill();
+            this.emitStompParticles(enemy.x + enemy.w / 2, enemy.y + enemy.h / 2, '#9fd0ff');
+          } else {
+            enemy.stun();
+            this.emitStompParticles(enemy.x + enemy.w / 2, enemy.y + 4, '#ffe27a');
+          }
+          return;
+        }
+
+        if (enemy.state !== 'stunned' && player.invulnerableTimer <= 0) {
+          this.triggerDeath('enemy');
+          return;
+        }
+      }
+    }
+
+    handleCoins() {
+      for (const coin of this.coins) {
+        if (coin.collected || !aabb(this.player.rect, coin.rect)) continue;
+        coin.collected = true;
+        this.coinCount++;
+        this.coinPopTimer = 0.28;
+        this.audio.playCoin();
+        this.emitCoinParticles(coin.x, coin.y);
+      }
+    }
+
+    handleCheckpoints() {
+      for (const checkpoint of this.checkpoints) {
+        if (!aabb(this.player.rect, checkpoint.rect)) continue;
+        if (checkpoint.index > this.lastCheckpointIndex) {
+          checkpoint.active = true;
+          this.lastCheckpointIndex = checkpoint.index;
+          this.checkpointDeaths = 0;
+          this.message = { text: `Checkpoint ${checkpoint.index + 1} activated`, time: 1.6 };
+          this.emitCheckpointParticles(checkpoint.x + 24, checkpoint.y + 28);
+        }
+      }
+    }
+
+    handleFlagpole() {
+      if (this.levelWon || !aabb(this.player.rect, this.flagpole.rect)) return;
+      if (this.coinCount >= REQUIRED_COINS) {
+        this.levelWon = true;
+        this.state = STATES.VICTORY;
+        this.audio.playVictory();
+      } else {
+        this.message = { text: `Collect more coins! (${this.coinCount} / ${REQUIRED_COINS})`, time: 1.4 };
+        this.player.x = Math.min(this.player.x, this.flagpole.x - this.player.w - 18);
+        this.player.vx = Math.min(0, this.player.vx);
+      }
+    }
+
+    triggerDeath(reason) {
+      if (this.deathTimer > 0 || this.player.invulnerableTimer > 0) return;
+      this.player.dead = true;
+      this.player.vx = 0;
+      this.player.vy = 0;
+      this.deathTimer = DEATH_DELAY;
+      this.deathFlash = 1;
+      this.jetpackTimer = 0;
+      this.clover = null;
+      this.cloverSpawnTimer = this.randomCloverDelay();
+      this.checkpointDeaths++;
+      this.audio.playDeath();
+      this.emitDeathParticles(this.player.centerX, this.player.centerY);
+      this.message = { text: reason === 'pit' ? 'You fell into a pit.' : 'Hit by a monster.', time: 1.1 };
+    }
+
+    finishDeath() {
+      this.deathTimer = 0;
+      this.deathFlash = 0;
+      if (this.checkpointDeaths > MAX_RESPAWNS_PER_CHECKPOINT) {
+        this.triggerGameOver('respawns');
+        return;
+      }
+      this.respawnPlayer();
+    }
+
+    respawnPlayer() {
+      const checkpoint = this.checkpoints[this.lastCheckpointIndex];
+      const spawnX = checkpoint ? checkpoint.spawnX : 80;
+      const spawnY = checkpoint ? checkpoint.spawnY : 520 - PLAYER.H;
+      this.player.reset(spawnX, spawnY);
+      this.resetEnemiesInActiveSection();
+      this.camera.snapTo(this.player);
+    }
+
+    resetEnemiesInActiveSection() {
+      const currentCheckpoint = this.checkpoints[this.lastCheckpointIndex];
+      const nextCheckpoint = this.checkpoints[this.lastCheckpointIndex + 1];
+      const startX = currentCheckpoint ? currentCheckpoint.x : 0;
+      const endX = nextCheckpoint ? nextCheckpoint.x : LEVEL_WIDTH;
+      for (const enemy of this.enemies) {
+        if (enemy.initialX >= startX - 40 && enemy.initialX < endX + 40) enemy.reset();
+      }
+    }
+
+    emitCoinParticles(x, y) {
+      for (let i = 0; i < 6; i++) {
+        const a = (Math.PI * 2 * i) / 6;
+        this.particles.push(new Particle(x, y, Math.cos(a) * 90, Math.sin(a) * 90 - 40, 0.38, '#ffd92f', 4, 300));
+      }
+    }
+
+    emitCloverParticles(x, y) {
+      for (let i = 0; i < 18; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const s = 70 + Math.random() * 160;
+        const color = Math.random() > 0.35 ? '#36e46c' : '#eaff72';
+        this.particles.push(new Particle(x, y, Math.cos(a) * s, Math.sin(a) * s - 80, 0.55, color, 5, 360));
+      }
+    }
+
+    emitStompParticles(x, y, color) {
+      for (let i = 0; i < 10; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const s = 80 + Math.random() * 110;
+        this.particles.push(new Particle(x, y, Math.cos(a) * s, Math.sin(a) * s - 50, 0.35, color, 5, 500));
+      }
+    }
+
+    emitDeathParticles(x, y) {
+      for (let i = 0; i < 14; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const s = 80 + Math.random() * 160;
+        this.particles.push(new Particle(x, y, Math.cos(a) * s, Math.sin(a) * s - 90, 0.6, '#ff5a5a', 5, 650));
+      }
+    }
+
+    emitCheckpointParticles(x, y) {
+      for (let i = 0; i < 12; i++) {
+        const a = (Math.PI * 2 * i) / 12;
+        this.particles.push(new Particle(x, y, Math.cos(a) * 120, Math.sin(a) * 120 - 20, 0.45, '#44e082', 4, 260));
+      }
+    }
+
+    draw() {
+      const ctx = this.ctx;
+      ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      this.drawBackground(ctx);
+
+      if (this.state !== STATES.START) {
+        this.drawWorld(ctx);
+        this.drawUI(ctx);
+      }
+
+      if (this.state === STATES.START) this.drawStartScreen(ctx);
+      if (this.state === STATES.PAUSED) this.drawPauseScreen(ctx);
+      if (this.state === STATES.GAME_OVER) this.drawGameOverScreen(ctx);
+      if (this.state === STATES.VICTORY) this.drawVictoryScreen(ctx);
+
+      if (this.message && this.state === STATES.PLAYING) this.drawMessage(ctx, this.message.text);
+
+      if (this.deathFlash > 0) {
+        ctx.save();
+        ctx.globalAlpha = this.deathFlash * 0.35;
+        ctx.fillStyle = '#ff4d4d';
+        ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+        ctx.restore();
+      }
+    }
+
+    drawBackground(ctx) {
+      const sky = ctx.createLinearGradient(0, 0, 0, CANVAS_HEIGHT);
+      sky.addColorStop(0, '#82b8ff');
+      sky.addColorStop(0.48, '#b6d1ff');
+      sky.addColorStop(1, '#e6d1a1');
+      ctx.fillStyle = sky;
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+      ctx.fillStyle = 'rgba(255,255,255,.55)';
+      ctx.beginPath();
+      ctx.arc(850, 88, 38, 0, Math.PI * 2);
+      ctx.fill();
+
+      for (const layer of this.bgLayers) {
+        for (const b of layer.buildings) {
+          const sx = Math.round(b.x - this.camera.x * layer.factor);
+          if (sx + b.w < -80 || sx > CANVAS_WIDTH + 80) continue;
+          ctx.fillStyle = b.color;
+          ctx.fillRect(sx, b.y, b.w, b.h);
+          if (b.roof === 'spire') {
+            ctx.beginPath();
+            ctx.moveTo(sx + b.w * 0.18, b.y);
+            ctx.lineTo(sx + b.w * 0.5, b.y - 34);
+            ctx.lineTo(sx + b.w * 0.82, b.y);
+            ctx.closePath();
+            ctx.fill();
+          } else if (b.roof === 'antenna') {
+            ctx.fillRect(sx + b.w / 2 - 1, b.y - 32, 2, 32);
+            ctx.fillRect(sx + b.w / 2 - 8, b.y - 22, 16, 2);
+          }
+          ctx.fillStyle = b.windowColor;
+          const wxStep = layer.factor < 0.3 ? 18 : 14;
+          const wyStep = layer.factor < 0.3 ? 24 : 20;
+          for (let wx = sx + 10; wx < sx + b.w - 8; wx += wxStep) {
+            for (let wy = b.y + 18; wy < b.y + b.h - 18; wy += wyStep) {
+              if (((wx + wy) / 7 | 0) % 3 === 0 && !b.lit) continue;
+              ctx.fillRect(wx, wy, 4, 7);
+            }
+          }
+        }
+      }
+
+      ctx.fillStyle = 'rgba(40,51,69,.45)';
+      ctx.fillRect(0, 520, CANVAS_WIDTH, 56);
+    }
+
+    drawWorld(ctx) {
+      ctx.save();
+      ctx.translate(-this.camera.x, -this.camera.y);
+      this.platforms.forEach((platform) => platform.draw(ctx));
+      this.coins.forEach((coin) => coin.draw(ctx));
+      if (this.clover) this.clover.draw(ctx);
+      this.checkpoints.forEach((checkpoint) => checkpoint.draw(ctx));
+      this.flagpole.draw(ctx);
+      this.enemies.forEach((enemy) => enemy.draw(ctx));
+      this.player.draw(ctx);
+      this.particles.forEach((particle) => particle.draw(ctx));
+      ctx.restore();
+    }
+
+    drawUI(ctx) {
+      const warning = this.state === STATES.PLAYING && this.timeLeft <= TIMER.WARNING_AT;
+      const blinkOn = !warning || Math.floor(this.elapsed * TIMER.BLINKS_PER_SECOND) % 2 === 0;
+      const secondsLeft = Math.ceil(this.timeLeft);
+
+      ctx.save();
+      ctx.font = 'bold 24px system-ui, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillStyle = warning ? 'rgba(90,0,0,.64)' : 'rgba(0,0,0,.42)';
+      drawRoundRect(ctx, 18, 16, 154, 42, 10);
+      ctx.fill();
+      if (warning) {
+        ctx.strokeStyle = blinkOn ? '#ff3b3b' : 'rgba(255,80,80,.25)';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+      }
+      ctx.fillStyle = warning ? (blinkOn ? '#ff3838' : '#ffc6c6') : '#ffffff';
+      ctx.fillText(`⏱ ${secondsLeft}s`, 30, 23);
+      ctx.restore();
+
+      ctx.save();
+      ctx.font = 'bold 24px system-ui, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      const scale = 1 + this.coinPopTimer * 0.7;
+      ctx.translate(18, 64);
+      ctx.scale(scale, scale);
+      ctx.fillStyle = 'rgba(0,0,0,.42)';
+      drawRoundRect(ctx, -8, -7, 176, 42, 10);
+      ctx.fill();
+      ctx.fillStyle = '#fff6cc';
+      ctx.fillText(`🪙 ${this.coinCount} / ${this.totalCoins}`, 0, 0);
+      ctx.restore();
+
+      ctx.save();
+      ctx.font = 'bold 15px system-ui, sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillStyle = 'rgba(0,0,0,.44)';
+      drawRoundRect(ctx, CANVAS_WIDTH - 196, 16, 176, 32, 8);
+      ctx.fill();
+      const remaining = Math.max(0, MAX_RESPAWNS_PER_CHECKPOINT - this.checkpointDeaths);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(`Checkpoint respawns: ${remaining}`, CANVAS_WIDTH - 30, 24);
+      ctx.restore();
+
+      if (this.jetpackTimer > 0) {
+        ctx.save();
+        ctx.font = 'bold 20px system-ui, sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillStyle = 'rgba(0,0,0,.48)';
+        drawRoundRect(ctx, 18, 110, 215, 36, 9);
+        ctx.fill();
+        ctx.fillStyle = this.jetpackTimer < 4 ? '#ffe769' : '#c8ffd1';
+        ctx.fillText(`🚀 Jetpack ${this.jetpackTimer.toFixed(1)}s`, 30, 117);
+        ctx.restore();
+      }
+    }
+
+    drawMessage(ctx, text) {
+      ctx.save();
+      ctx.font = 'bold 28px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      const w = ctx.measureText(text).width + 48;
+      drawRoundRect(ctx, CANVAS_WIDTH / 2 - w / 2, 78, w, 48, 12);
+      ctx.fillStyle = 'rgba(0,0,0,.62)';
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(text, CANVAS_WIDTH / 2, 111);
+      ctx.restore();
+    }
+
+    drawStartScreen(ctx) {
+      this.camera.x = 0;
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,.42)';
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 68px system-ui, sans-serif';
+      ctx.fillText('Mias in the City', CANVAS_WIDTH / 2, 190);
+      ctx.font = 'bold 28px system-ui, sans-serif';
+      ctx.fillStyle = '#fff6cc';
+      ctx.fillText('Press Space to Start', CANVAS_WIDTH / 2, 260);
+      ctx.font = '18px system-ui, sans-serif';
+      ctx.fillStyle = '#e8edf8';
+      ctx.fillText('Move: Arrow Keys / WASD   Jump: Space / Up / W   Pause: P / Esc', CANVAS_WIDTH / 2, 315);
+      ctx.fillText('Collect at least 25 coins, stomp monsters twice, and reach the flagpole.', CANVAS_WIDTH / 2, 348);
+      ctx.fillText('You have 45 seconds. At 15 seconds, the timer turns into a tiny panic machine.', CANVAS_WIDTH / 2, 378);
+      ctx.fillText('Lucky clovers can appear: eat one, then hold Jump to fly for 20 seconds.', CANVAS_WIDTH / 2, 408);
+      ctx.restore();
+    }
+
+    drawPauseScreen(ctx) {
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,.55)';
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 52px system-ui, sans-serif';
+      ctx.fillText('PAUSED', CANVAS_WIDTH / 2, 260);
+      ctx.font = '24px system-ui, sans-serif';
+      ctx.fillText('Press P or Escape to resume', CANVAS_WIDTH / 2, 310);
+      ctx.restore();
+    }
+
+    drawGameOverScreen(ctx) {
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,.65)';
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#ffdddd';
+      ctx.font = 'bold 58px system-ui, sans-serif';
+      ctx.fillText('GAME OVER', CANVAS_WIDTH / 2, 230);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '24px system-ui, sans-serif';
+      ctx.fillText(this.gameOverReason, CANVAS_WIDTH / 2, 285);
+      ctx.fillText('Press Space to restart from the beginning', CANVAS_WIDTH / 2, 330);
+      ctx.restore();
+    }
+
+    drawVictoryScreen(ctx) {
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,.55)';
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff6cc';
+      ctx.font = 'bold 64px system-ui, sans-serif';
+      ctx.fillText('VICTORY!', CANVAS_WIDTH / 2, 220);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '28px system-ui, sans-serif';
+      ctx.fillText(`Coins collected: ${this.coinCount} / ${this.totalCoins}`, CANVAS_WIDTH / 2, 280);
+      ctx.font = '23px system-ui, sans-serif';
+      ctx.fillText(`Time left: ${Math.ceil(this.timeLeft)}s`, CANVAS_WIDTH / 2, 320);
+      ctx.fillText('Press Space to play again', CANVAS_WIDTH / 2, 360);
+      ctx.restore();
+    }
+  }
+
+  new Game(document.getElementById('game'));
+})();
+</script>
+</body>
+</html>
